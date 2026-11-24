@@ -1,1 +1,315 @@
-# ChurchRegister
+# ⛪ Church Attendance Tracker
+
+A full-stack attendance system for churches. The **main admin** manages members,
+services, users, reports and settings; **ushers** get a focused screen to record
+Present / Absent / Excused during a live service in just a few taps.
+
+| Layer | Technology |
+|---|---|
+| Frontend | React 18 · React Router 6 · Vite · hand-rolled CSS design system |
+| Backend | Node.js · Express 4 · REST API |
+| Database | PostgreSQL (parameterised queries, SQL migrations) |
+| Auth | bcryptjs password hashing · JWT access token (15 min) + rotating refresh token (30 days, sliding) in HttpOnly cookies |
+| Tests | Jest + Supertest (auth, RBAC, members, services, attendance, users) + offline unit suites (Excel writer, report export, session) |
+
+---
+
+## Quick start
+
+### 0. Prerequisites
+
+- Node.js 18+
+- **PostgreSQL 13+** running locally (create nothing manually — the scripts do it)
+- If PostgreSQL is missing:
+  - Windows: install from <https://www.postgresql.org/download/windows/>
+  - or `docker run --name cat-pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16`
+
+### 1. Install
+
+```bash
+npm run install:all        # installs server/, client/ and the root runner
+```
+
+### 2. Configure environment
+
+```bash
+cp server/.env.example server/.env
+```
+
+Defaults expect `postgres/postgres@localhost:5432`. Adjust `DATABASE_URL`,
+`DATABASE_URL_TEST` and the JWT secrets if needed. To enable SMS delivery, set
+`MNOTIFY_API_KEY` and a registered `MNOTIFY_SENDER_ID` (maximum 11 characters)
+in `server/.env`; leaving either empty keeps SMS sends in dry-run mode. See
+[mNotify's SMS API documentation](https://developer.bms.africa/#tag/SMS).
+
+### 3. Migrate + create an admin
+
+```bash
+npm run migrate            # creates tables (tracked in _migrations)
+npm run create:admin       # reads ADMIN_NAME, ADMIN_EMAIL and ADMIN_PASSWORD from server/.env
+```
+
+### 4. Run
+
+```bash
+npm run dev                # API on http://localhost:4000 + web on http://localhost:5173
+```
+
+The Vite dev server proxies `/api` to the backend, so cookies just work.
+For production: `npm run build` then `npm start` — Express serves `client/dist`.
+
+### Accounts — no defaults anywhere
+
+There is deliberately **no public sign-up**, and **no password is hardcoded** in
+this codebase — accounts exist only in your database.
+
+- **Local development**: `npm run create:admin` creates the initial admin using
+  `ADMIN_NAME`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` from `server/.env`.
+- **Production**: the first admin is created automatically from the
+  `ADMIN_EMAIL` / `ADMIN_PASSWORD` env vars (plus optional `ADMIN_USERNAME`) on the first request after deploy —
+  but **only while the users table is empty**. Ushers are created by that admin
+  inside the app (one-time temporary passwords).
+- Changing `ADMIN_PASSWORD` in Vercel later does **not** update an existing
+  account. To rotate: in Neon's SQL Editor run
+  `DELETE FROM users WHERE email = 'the-old-email';` then redeploy — the
+  bootstrap re-creates the admin from the current env values.
+
+### Tests
+
+```bash
+npm test                   # auto-creates church_attendance_test DB, migrates, runs Jest
+```
+---
+
+## Features
+
+### Admin
+- **Overview dashboard** – latest service numbers, 4-service average, active members,
+  open follow-ups, 12-service trend chart, recent services, latest records,
+  high-priority follow-up list.
+- **Attendance screen** – service selector, search, group & status filters,
+  Present/Absent/Excused controls, notes, save button, marked counter,
+  last-updated time, and **who recorded each entry**.
+- **Members** – full CRUD, activate/deactivate, per-member history page with
+  totals, consecutive-absence streaks, group & contact info, follow-up plans.
+- **Services** – create/edit, upcoming/past tabs, headcount, per-service roster view.
+- **Reports** – totals, trends, by service/group/usher, repeat absentees,
+  active-vs-inactive, CSV export for attendance and members, plus a one-click
+  Excel workbook (charted summary dashboard + a sheet per table).
+- **User management** – create usher/admin accounts, one-time temporary passwords,
+  reset passwords, deactivate/reactivate, last login, records created per usher.
+- **Settings** – church name, usher correction toggle + window, contact visibility,
+  groups and locations CRUD.
+
+### Usher (restricted by the server, not just hidden in the UI)
+- Sign in with admin-issued credentials.
+- Pick today's service → search/filter members → tap **P / A / E** → optional note
+  → **Save attendance**. Nothing else is reachable: no members CRUD, no reports,
+  no settings, no other users. Contact details are hidden unless the admin allows them.
+
+## Security model
+
+- Passwords hashed with bcrypt (cost 10; 4 in tests). Plaintext is never stored or returned.
+- Login rate-limited (10 attempts / 15 min / IP+email) with account-enumeration-safe errors.
+- Access JWT (15 min) + refresh JWT (30 days, sliding) in **HttpOnly, SameSite=Lax** cookies;
+  refresh tokens are rotated and stored as SHA-256 hashes so they can be revoked.
+- Logout, deactivation and password reset revoke sessions immediately.
+- `authenticate` middleware re-loads the user on every request (deactivated = cut off).
+- `requireAdmin` guards every admin-only route server-side; ushers receive `403`.
+- All SQL uses parameterised queries; unique constraint prevents duplicate
+  member/service attendance even under concurrent writes (upsert semantics).
+- Audit trail: `recorded_by_user_id`, `updated_by_user_id`, `recorded_at`, `updated_at`
+  on every attendance row; `created_by` on users/services/follow-ups.
+- Ushers may correct **only their own** records, only while the admin-enabled window
+  (default 30 min) is open.
+
+### Staying signed in on the installed app (PWA)
+
+The app is meant to live on a phone home screen, so closing it must not sign
+anyone out.
+
+- The access cookie only has to survive one app session; the **refresh cookie is
+  what carries the session**. It lasts 30 days and *slides*: every silent refresh
+  rotates it and grants a fresh full window, so a device that opens the app at
+  least once a month never asks for a password again. Tune with
+  `REFRESH_TOKEN_TTL_DAYS` (keep it ≥ 30 — the gap between services can be weeks).
+- The silent refresh lives in `client/src/api/client.js`. Only the session
+  boundaries (`POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`) are
+  excluded from it; everything else — including `GET /auth/me`, the call that
+  rehydrates the session on app start — is retried once through the refresh
+  cookie on a 401.
+- **`COOKIE_SECURE` must match how the app is served.** A `Secure` cookie is
+  silently discarded over plain `http`, except on `http://localhost` where
+  browsers make an exception. So `COOKIE_SECURE=true` can look fine on the dev PC
+  while breaking every phone opening the installed PWA over a LAN IP. Use `false`
+  locally, `true` in production (HTTPS).
+- Signing out also clears the service-worker API cache (see `clearApiCache()`),
+  so a shared phone cannot show the previous user's cached data. A session that
+  merely *expires* keeps its cache, so ushers can still work from cached rosters
+  in a dead spot.
+- iOS caps cookie storage for sites with no user interaction in 7 days; opening
+  the app inside that window keeps the session alive.
+
+### Pull to refresh
+
+A native-style pull-down gesture is wired into both the admin and usher layouts.
+Drag down from the top of any page (touch on a phone, or mouse drag on desktop)
+past the threshold to refresh: the service-worker API cache is cleared first so
+the next data fetch hits the network instead of stale cached data, then the page
+reloads with fresh content.
+
+
+
+
+
+## API overview (`/api`)
+
+| Area | Endpoints | Access |
+|---|---|---|
+| Health | `GET /health` | public |
+| Auth | `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`, `POST /auth/change-password` | public / signed-in |
+| Users | `GET·POST /users`, `PUT /users/:id`, `PATCH /users/:id/status`, `POST /users/:id/reset-password`, `GET /users/:id/attendance-records` | admin |
+| Members | `GET·POST /members`, `GET·PUT /members/:id`, `PATCH /members/:id/status`, `GET /members/:id/attendance` | admin |
+| Services | `GET /services`, `GET /services/:id` | admin + usher |
+| Services | `POST /services`, `PUT /services/:id`, `GET /services/:id/attendance` | admin |
+| Attendance | `GET /attendance/roster/:serviceId`, `POST /attendance` | admin + usher |
+| Attendance | `PUT /attendance/:id` | admin (or own record within usher window) |
+| Attendance | `GET /attendance`, `GET /attendance/:id`, `DELETE /attendance/:id` | admin |
+| Groups/Locations | `GET …` shared · `POST·PUT·DELETE …` admin |
+| Follow-ups | `/followups` CRUD | admin |
+| Reports | `GET /reports/dashboard`, `GET /reports/summary`, `GET /reports/locals`, `GET /reports/export` (Excel) | admin |
+| Settings | `GET /settings/public` shared · `GET·PUT /settings` admin |
+
+Validation errors return `400 { message, errors:[{field,message}] }`; authorization
+failures return clear `401`/`403` messages.
+
+## Project structure
+
+```
+server/
+  src/
+    config/     env.js db.js
+    middleware/ auth.js (authenticate, requireAdmin) error.js
+    routes/     auth users members services attendance groups locations followups reports settings index
+    services/   stats.js (streak recompute) settings.js
+    utils/      errors validate tokens passwords xlsx (Excel writer)
+  migrations/   schema.sql (complete consolidated schema; auto-applied on deploy)
+  scripts/      migrate.js create-admin.js
+  tests/        global-setup helpers auth rbac members services attendance users
+                unit/ (xlsx-writer report-export session — no Postgres needed)
+client/
+  src/
+    api/          fetch wrapper w/ silent refresh
+    auth/         context + route guards
+    components/   ui/ (forms display feedback Table Modal SearchInput) layout/ charts/
+    hooks/        useFetch useDebounce useRoster
+    pages/        login, denied, 404, admin/* (8 pages), usher/* (2 pages)
+    styles.css    design tokens + components + responsive rules
+    utils/        csv download format
+  tests/          api-client.test.js (Node built-in runner — npm test)
+```
+
+## Design notes
+
+- Palette: white surfaces, blue primary (`#1d4ed8` family), yellow accent (`#f59e0b`),
+  deep navy sidebar — per the final colour directive (white/blue/yellow).
+- Status colours: green Present, red Absent, blue Excused, neutral Inactive.
+- Tables collapse into labelled cards on small screens; forms are fully labelled
+  with `aria-invalid`/`aria-describedby`, dialogs trap focus and close on Esc;
+  reduced-motion preferences are respected.
+
+## Assumptions & limitations
+
+- The sign-in page shows **no demo credentials** — nothing about accounts is hardcoded client-side.
+- `consecutive_absences` counts leading consecutive `absent` marks; `excused` pauses
+  the streak without punishing, `present` resets it.
+- CSV export is generated client-side from paginated API data; the Excel
+  workbook (`GET /reports/export`) is built server-side with native charts.
+- SameSite=Lax cookies + JSON-only APIs are the CSRF mitigation strategy; add a
+  token header if you embed the API behind a different origin.
+---
+
+## 🚀 Deploying to Vercel
+
+Recommended topology: **one Vercel project** that serves the React build as static
+files and runs the Express API as a Serverless Function behind `/api/*`.
+Same-origin means cookies and CORS work exactly like local development.
+
+The repo is already wired for this: `api/index.js` (serverless entry),
+`vercel.json` (build + rewrites incl. SPA fallback), and root `package.json`
+carries the server dependencies so Vercel bundles them.
+
+### 1 · Provision PostgreSQL (one-time)
+
+Vercel does not include a database, so create one first —
+[Neon](https://neon.tech) has a free tier and works great:
+
+1. Sign up → **New Project** → copy the **pooled connection string**
+   (`postgres://…?sslmode=require`).
+2. Supabase / Railway / Render Postgres work equally well; any TCP-reachable
+   Postgres 13+ is fine. TLS is auto-detected from `sslmode=` in the URL.
+
+For a fresh deployment, use the new database project's connection string as
+`DATABASE_URL` in the deployment platform. This leaves any existing database
+and your local `server/.env` untouched.
+
+### 2 · Database setup — automatic (no terminal needed)
+
+The app **self-bootstraps**: on its first API request it applies pending
+migrations automatically and, if you set `ADMIN_EMAIL` + `ADMIN_PASSWORD`
+environment variables and no users exist yet, creates that admin for you
+(password change forced at first login). Nothing to run by hand.
+
+Prefer doing it manually instead? Run these locally against the cloud database:
+
+```powershell
+$env:DATABASE_URL = "postgres://user:pass@host/db?sslmode=require"
+npm run migrate
+npm run create:admin -- "Pastor Kwesi Mensah" "admin@copagonaahanta.app" "ChangeMe-123"
+```
+
+`create:admin` upserts a single admin; set `ADMIN_USERNAME` to also give them a
+username for sign-in. Other accounts can be created by an admin inside the app.
+
+### 3 · Import the repo on Vercel
+
+1. Push the project to GitHub (`.gitignore` already excludes `.env`, `.vercel/`).
+2. <https://vercel.com/new> → import the repository.
+3. Framework Preset **Other** — build/output settings come from `vercel.json`
+   (builds `client/`, serves `client/dist`, routes `/api/*` to the function).
+4. Deploy — it will fail-safe until env vars exist; add them now:
+
+| Variable | Value |
+|---|---|
+| `DATABASE_URL` | your Neon/Supabase connection string |
+| `JWT_ACCESS_SECRET` | long random string — `openssl rand -hex 32` |
+| `JWT_REFRESH_SECRET` | different long random string |
+| `COOKIE_SECURE` | `true` |
+| `BCRYPT_ROUNDS` | `10` |
+| `ADMIN_EMAIL` | required — email for the first admin |
+| `ADMIN_PASSWORD` | required — initial password (at least 8 characters; change at first sign-in) |
+| `ADMIN_NAME` | optional — defaults to `Main Admin` |
+| `ADMIN_USERNAME` | optional — lets the first admin sign in with a username instead of email |
+
+5. Redeploy → open `https://<your-app>.vercel.app`, sign in as the admin,
+   change the temp password, create usher accounts under **Users**.
+
+### Alternative: split hosting
+
+Frontend on Vercel + always-on API on Render/Railway/Fly also works. Point the
+frontend proxy at nothing (use absolute API URL by serving client from the API
+or adding a reverse proxy) and set on the **API host**:
+
+```
+CORS_ORIGIN=https://<your-app>.vercel.app
+COOKIE_SECURE=true
+COOKIE_SAMESITE=none     # required for cross-site cookies
+```
+
+### Serverless notes & limits
+
+- The in-memory login rate limiter is per-instance (best-effort on serverless).
+- Each function instance keeps its own small pg pool (max 10) — use Neon pooled
+  connections to stay under connection limits.
+- Pending migrations are applied automatically on the first API request after
+  deployment.
